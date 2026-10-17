@@ -1,0 +1,558 @@
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from pathlib import Path
+ 
+st.set_page_config(page_title="GAC · Análisis Univariado", page_icon="📊", layout="wide")
+ 
+CSV = "Plazas_sin_nulos.csv"
+DIAS = {0: "Lunes", 1: "Martes", 2: "Miércoles", 3: "Jueves", 4: "Viernes", 5: "Sábado", 6: "Domingo"}
+ 
+ 
+def arreglar_texto(s):
+    """Corrige texto UTF-8 mal leído (GonzÃ¡les -> González) y espacios repetidos."""
+    if not isinstance(s, str):
+        return s
+    for enc in ("cp1252", "latin-1"):
+        try:
+            s = s.encode(enc).decode("utf-8")
+            break
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+    return " ".join(s.split())
+ 
+ 
+@st.cache_data
+def load_data():
+    base = Path(__file__).parent
+    ruta = next(p for p in (base / CSV, base / "data" / CSV) if p.exists())
+    df = pd.read_csv(ruta, encoding="utf-8-sig")
+ 
+    # --- Transformaciones ---
+    for c in ["Asesor", "Producto", "Origen", "Estatus"]:
+        df[c] = df[c].map(arreglar_texto)
+    df["Producto"] = df["Producto"].str.upper()
+    df["Asesor"] = df["Asesor"].str.title()
+    df["Origen"] = df["Origen"].str.title()
+    df["Estatus"] = df["Estatus"].replace({"Contactato": "Contactado", "False": "Sin estatus", "FALSE": "Sin estatus"})
+    for c in ["Seguimiento", "Cita efetiva", "PDM", "SDC"]:
+        df[c] = df[c].map({1.0: "Sí", 0.0: "No"})
+ 
+    # --- Variables derivadas de la fecha (permiten heatmap y boxplot) ---
+    df["Fecha Origen"] = pd.to_datetime(df["Fecha Origen"], errors="coerce")
+    df["Hora"] = df["Fecha Origen"].dt.hour
+    df["Día de la semana"] = df["Fecha Origen"].dt.dayofweek.map(DIAS)
+    df["Franja horaria"] = pd.cut(df["Hora"], [-1, 11, 14, 17, 23],
+                                  labels=["Mañana (<12h)", "Mediodía (12-14h)", "Tarde (15-17h)", "Noche (18h+)"]).astype(str)
+    df = df.dropna(subset=["Hora"])
+ 
+    Lista = ["Producto", "Asesor", "Estatus"]
+    Cruce = ["Origen", "Franja horaria", "Día de la semana", "Seguimiento", "Cita efetiva", "PDM", "SDC"] + Lista
+    return df, Lista, Cruce
+ 
+ 
+df, Lista, Cruce = load_data()
+ 
+# ================= BARRA LATERAL =================
+st.sidebar.title("🚗 GAC · Leads Plazas")
+View = st.sidebar.selectbox("Tipo de Análisis", ["Extracción de Características", "Regresión Lineal Simple",
+                                                  "Regresión Lineal Múltiple", "Regresión Logística", "Base de datos limpia"])
+ 
+origenes = st.sidebar.multiselect("📍 Origen (plaza)", sorted(df["Origen"].unique()), default=sorted(df["Origen"].unique()))
+h_min, h_max = st.sidebar.slider("⏰ Hora de origen del lead", 0, 23, (0, 23))
+dff = df[df["Origen"].isin(origenes) & df["Hora"].between(h_min, h_max)]
+if dff.empty:
+    st.warning("No hay datos con los filtros seleccionados.")
+    st.stop()
+ 
+ 
+# ================= FUNCIONES PARA REGRESIÓN LINEAL =================
+def tabla_diaria(d):
+    """Agrupa los leads por día para obtener variables numéricas."""
+    t = d.assign(Fecha=d["Fecha Origen"].dt.normalize(),
+                 _seg=(d["Seguimiento"] == "Sí").astype(int), _cita=(d["Cita efetiva"] == "Sí").astype(int),
+                 _pdm=(d["PDM"] == "Sí").astype(int), _sdc=(d["SDC"] == "Sí").astype(int),
+                 _emz=(d["Producto"] == "EMZOOM").astype(int), _gs8=(d["Producto"] == "GS8").astype(int))
+    g = t.groupby("Fecha").agg(**{"Leads": ("Hora", "size"), "Hora promedio": ("Hora", "mean"),
+                                  "Seguimientos": ("_seg", "sum"), "Citas efectivas": ("_cita", "sum"),
+                                  "Pruebas de manejo": ("_pdm", "sum"), "Solicitudes de crédito": ("_sdc", "sum"),
+                                  "Leads EMZOOM": ("_emz", "sum"), "Leads GS8": ("_gs8", "sum")}).reset_index()
+    g["Día de la semana (0=Lun)"] = g["Fecha"].dt.dayofweek
+    g["Día del periodo"] = (g["Fecha"] - g["Fecha"].min()).dt.days
+    return g
+ 
+ 
+def regresion(X, y):
+    """Mínimos cuadrados: devuelve coeficientes, predicciones, R2, R2 ajustada, RMSE y MAE."""
+    A = np.column_stack([np.ones(len(X)), X])
+    b = np.linalg.lstsq(A, y, rcond=None)[0]
+    pred = A @ b
+    sse = ((y - pred) ** 2).sum()
+    sst = ((y - y.mean()) ** 2).sum()
+    r2 = 1 - sse / sst if sst > 0 else 0.0
+    n, k = len(y), X.shape[1]
+    r2a = 1 - (1 - r2) * (n - 1) / (n - k - 1) if n - k - 1 > 0 else np.nan
+    return b, pred, r2, r2a, np.sqrt(sse / n), np.abs(y - pred).mean()
+ 
+ 
+def lectura_r2(r2):
+    return "débil" if r2 < 0.3 else ("moderada" if r2 < 0.6 else "fuerte")
+ 
+ 
+def ajustar(fig, h=450):
+    """Deja la leyenda arriba y reserva márgenes para que no se encimen los textos."""
+    fig.update_layout(height=h, margin=dict(t=70, b=70, l=60, r=20),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+    fig.update_xaxes(automargin=True, title_standoff=15)
+    fig.update_yaxes(automargin=True, title_standoff=15)
+    return fig
+ 
+ 
+# ================= FUNCIONES PARA REGRESIÓN LOGÍSTICA =================
+METODOS = ["Sin ajuste", "Reponderación de clases", "Oversampling"]
+ 
+ 
+def sigmoide(z):
+    return 1 / (1 + np.exp(-np.clip(z, -30, 30)))
+ 
+ 
+def ajustar_logit(X, y, pesos=None, l2=1.0, iters=100):
+    """Regresión logística por Newton-Raphson (IRLS) con pesos por observación y penalización L2 ligera."""
+    A = np.column_stack([np.ones(len(X)), X])
+    w = np.ones(len(y)) if pesos is None else pesos
+    b = np.zeros(A.shape[1])
+    pen = np.eye(A.shape[1]) * l2
+    pen[0, 0] = 0  # el intercepto no se penaliza
+    for _ in range(iters):
+        p = sigmoide(A @ b)
+        grad = A.T @ (w * (y - p)) - pen @ b
+        H = (A * (w * p * (1 - p))[:, None]).T @ A + pen + 1e-8 * np.eye(A.shape[1])
+        paso = np.linalg.solve(H, grad)
+        b = b + paso
+        if np.abs(paso).max() < 1e-8:
+            break
+    return b
+ 
+ 
+def partir_estratificado(y, test, seed):
+    """Separa entrenamiento/prueba conservando la proporción de cada clase."""
+    rng = np.random.default_rng(seed)
+    tr, te = [], []
+    for clase in (0, 1):
+        idx = rng.permutation(np.where(y == clase)[0])
+        n_te = min(max(1, int(round(test * len(idx)))), len(idx) - 1)
+        te += list(idx[:n_te])
+        tr += list(idx[n_te:])
+    return np.array(tr), np.array(te)
+ 
+ 
+def sobremuestrear(X, y, seed):
+    """Oversampling aleatorio: duplica casos de la clase minoritaria hasta igualar a la mayoritaria."""
+    rng = np.random.default_rng(seed)
+    n1, n0 = int((y == 1).sum()), int((y == 0).sum())
+    minoria = 1 if n1 < n0 else 0
+    idx_min = np.where(y == minoria)[0]
+    extra = rng.choice(idx_min, abs(n0 - n1), replace=True)
+    idx = np.concatenate([np.arange(len(y)), extra])
+    return X[idx], y[idx]
+ 
+ 
+def entrenar(Xtr, ytr, metodo, seed, l2):
+    """Estandariza con datos de entrenamiento, aplica el método de balanceo y ajusta el modelo."""
+    mu = Xtr.mean(axis=0)
+    sd = Xtr.std(axis=0)
+    sd[sd == 0] = 1.0
+    Xs = (Xtr - mu) / sd
+    pesos = None
+    if metodo == "Reponderación de clases":
+        n = len(ytr)
+        pesos = np.where(ytr == 1, n / (2 * (ytr == 1).sum()), n / (2 * (ytr == 0).sum()))
+    elif metodo == "Oversampling":
+        Xs, ytr = sobremuestrear(Xs, ytr, seed)
+    return ajustar_logit(Xs, ytr, pesos, l2), mu, sd
+ 
+ 
+def proba(modelo, X):
+    b, mu, sd = modelo
+    return sigmoide(b[0] + ((X - mu) / sd) @ b[1:])
+ 
+ 
+def auc_roc(y, p):
+    r = pd.Series(p).rank().to_numpy()
+    n1, n0 = int((y == 1).sum()), int((y == 0).sum())
+    return (r[y == 1].sum() - n1 * (n1 + 1) / 2) / (n1 * n0) if n1 and n0 else np.nan
+ 
+ 
+def curva_roc(y, p):
+    o = np.argsort(-p)
+    ys = y[o]
+    tpr = np.concatenate([[0], np.cumsum(ys) / max(ys.sum(), 1)])
+    fpr = np.concatenate([[0], np.cumsum(1 - ys) / max((1 - ys).sum(), 1)])
+    return fpr, tpr
+ 
+ 
+def metricas(y, p, umbral):
+    pred = (p >= umbral).astype(int)
+    tp = int(((pred == 1) & (y == 1)).sum())
+    tn = int(((pred == 0) & (y == 0)).sum())
+    fp = int(((pred == 1) & (y == 0)).sum())
+    fn = int(((pred == 0) & (y == 1)).sum())
+    div = lambda a, b: a / b if b else 0.0
+    prec, sens = div(tp, tp + fp), div(tp, tp + fn)
+    return {"tp": tp, "tn": tn, "fp": fp, "fn": fn,
+            "Exactitud": div(tp + tn, len(y)), "Precisión": prec, "Sensibilidad": sens,
+            "Especificidad": div(tn, tn + fp), "F1": div(2 * prec * sens, prec + sens), "AUC": auc_roc(y, p)}
+ 
+ 
+def codificar(X_raw, categoricas):
+    """Variables categóricas -> dummies (0/1)."""
+    return pd.get_dummies(X_raw, columns=categoricas, drop_first=True, dtype=float)
+ 
+ 
+# ================= VISTA 1: EXTRACCIÓN DE CARACTERÍSTICAS =================
+if View == "Extracción de Características":
+    Variable_Cat = st.sidebar.selectbox("📊 Variable a analizar", Lista)
+    Variable_Cruce = st.sidebar.selectbox("🔥 Variable de cruce (heatmap)", [c for c in Cruce if c != Variable_Cat])
+ 
+    Tabla_frecuencias = dff[Variable_Cat].value_counts().reset_index()
+    Tabla_frecuencias.columns = ["categorias", "frecuencia"]
+    Tabla_frecuencias["porcentaje (%)"] = (100 * Tabla_frecuencias["frecuencia"] / Tabla_frecuencias["frecuencia"].sum()).round(1)
+ 
+    st.title(f"Extracción de Características · {Variable_Cat}")
+ 
+    # KPIs
+    top = Tabla_frecuencias.iloc[0]
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("👥 Leads", len(dff))
+    k2.metric("🏷️ Categorías", len(Tabla_frecuencias))
+    k3.metric("🥇 Categoría más frecuente", str(top["categorias"]))
+    k4.metric("📞 Con seguimiento", f"{100 * (dff['Seguimiento'] == 'Sí').mean():.0f}%")
+    st.info(f"**Hallazgo:** «{top['categorias']}» concentra {top['porcentaje (%)']}% de los leads ({top['frecuencia']} de {len(dff)}).")
+ 
+    # Fila 1
+    Contenedor_A, Contenedor_B = st.columns(2)
+    with Contenedor_A:
+        st.write("Gráfico de Barras")
+        figure1 = px.bar(Tabla_frecuencias, x="categorias", y="frecuencia", text="frecuencia", color="categorias",
+                         title="Frecuencia por categoría", color_discrete_sequence=px.colors.qualitative.Bold)
+        figure1.update_xaxes(automargin=True, tickangle=-35)
+        figure1.update_layout(height=380, showlegend=False)
+        st.plotly_chart(figure1, use_container_width=True)
+    with Contenedor_B:
+        st.write("Gráfico de Pastel")
+        figure2 = px.pie(Tabla_frecuencias, names="categorias", values="frecuencia", title="Proporción por categoría",
+                         color_discrete_sequence=px.colors.qualitative.Vivid)
+        figure2.update_layout(height=380)
+        st.plotly_chart(figure2, use_container_width=True)
+ 
+    # Fila 2
+    Contenedor_C, Contenedor_D = st.columns(2)
+    with Contenedor_C:
+        st.write("Gráfico de anillo o dona")
+        figure3 = px.pie(Tabla_frecuencias, names="categorias", values="frecuencia", hole=0.4, title="Proporción por categoría",
+                         color_discrete_sequence=px.colors.qualitative.Pastel)
+        figure3.update_layout(height=380)
+        st.plotly_chart(figure3, use_container_width=True)
+    with Contenedor_D:
+        st.write("Gráfico de área")
+        figure4 = px.area(Tabla_frecuencias, x="categorias", y="frecuencia", title="Frecuencia por categoría", markers=True)
+        figure4.update_xaxes(automargin=True, tickangle=-35)
+        figure4.update_layout(height=380)
+        st.plotly_chart(figure4, use_container_width=True)
+ 
+    # Fila 3 (HEATMAP y BOXPLOT)
+    Contenedor_E, Contenedor_F = st.columns(2)
+    with Contenedor_E:
+        st.write("🔥 Heatmap (cruce de variables)")
+        ct = pd.crosstab(dff[Variable_Cat], dff[Variable_Cruce])
+        figure5 = px.imshow(ct, text_auto=True, aspect="auto", color_continuous_scale="Reds",
+                            title=f"{Variable_Cat} × {Variable_Cruce}")
+        figure5.update_layout(height=420)
+        st.plotly_chart(figure5, use_container_width=True)
+    with Contenedor_F:
+        st.write("📦 Boxplot (hora de origen del lead)")
+        figure6 = px.box(dff, x=Variable_Cat, y="Hora", color=Variable_Cat, points="outliers",
+                         title=f"Hora de origen por {Variable_Cat}", color_discrete_sequence=px.colors.qualitative.Safe)
+        figure6.update_xaxes(automargin=True, tickangle=-35)
+        figure6.update_layout(height=420, showlegend=False)
+        st.plotly_chart(figure6, use_container_width=True)
+ 
+    # Tabla de frecuencias
+    st.write("📋 Tabla de frecuencias")
+    st.dataframe(Tabla_frecuencias, use_container_width=True, hide_index=True)
+ 
+# ================= VISTA 2: BASE DE DATOS =================
+elif View == "Base de datos limpia":
+    st.title("Base de datos limpia")
+    st.write(f"{len(dff)} registros · {dff.shape[1]} columnas")
+    st.dataframe(dff, use_container_width=True)
+    st.download_button("⬇️ Descargar CSV filtrado", dff.to_csv(index=False).encode("utf-8-sig"), "leads_filtrado.csv", "text/csv")
+ 
+# ================= VISTA 3: REGRESIÓN LINEAL SIMPLE =================
+elif View == "Regresión Lineal Simple":
+    st.title("📈 Regresión Lineal Simple")
+    datos = tabla_diaria(dff)
+    num = [c for c in datos.columns if c != "Fecha"]
+    if len(datos) < 3:
+        st.warning("Hay muy pocos días con los filtros actuales para ajustar una regresión.")
+        st.stop()
+ 
+    c1, c2 = st.columns(2)
+    X_var = c1.selectbox("Variable independiente (X)", num, index=num.index("Leads EMZOOM"))
+    opciones_y = [c for c in num if c != X_var]
+    Y_var = c2.selectbox("Variable dependiente (Y)", opciones_y, index=opciones_y.index("Leads") if "Leads" in opciones_y else 0)
+ 
+    x = datos[X_var].to_numpy(float)
+    y = datos[Y_var].to_numpy(float)
+    if x.std() == 0 or y.std() == 0:
+        st.warning("Una de las variables no varía con estos filtros; elige otra.")
+        st.stop()
+    b, pred, r2, r2a, rmse, mae = regresion(x.reshape(-1, 1), y)
+ 
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("🔗 Correlación (r)", f"{np.corrcoef(x, y)[0, 1]:.2f}")
+    m2.metric("🎯 R²", f"{r2:.3f}")
+    m3.metric("📏 RMSE", f"{rmse:.2f}")
+    m4.metric("📐 MAE", f"{mae:.2f}")
+    st.info(f"**Ecuación:** {Y_var} = {b[0]:.3f} + {b[1]:.3f} × ({X_var})  ·  Relación {lectura_r2(r2)}: "
+            f"{X_var} explica {100 * r2:.1f}% de la variación de {Y_var} (n = {len(datos)} días).")
+ 
+    Contenedor_A, Contenedor_B = st.columns(2)
+    with Contenedor_A:
+        st.write("Dispersión de datos reales vs. predichos")
+        o = np.argsort(x)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=x, y=y, mode="markers", name="Datos reales", marker=dict(size=9, color="#636EFA")))
+        fig.add_trace(go.Scatter(x=x, y=pred, mode="markers", name="Datos predichos", marker=dict(size=8, symbol="diamond", color="#EF553B")))
+        fig.add_trace(go.Scatter(x=x[o], y=pred[o], mode="lines", name="Recta de regresión", line=dict(color="#EF553B")))
+        fig.update_layout(xaxis_title=X_var, yaxis_title=Y_var)
+        ajustar(fig)
+        st.plotly_chart(fig, use_container_width=True)
+    with Contenedor_B:
+        st.write("Residuos (real − predicho)")
+        fig_r = go.Figure(go.Scatter(x=pred, y=y - pred, mode="markers", marker=dict(size=9, color="#00CC96")))
+        fig_r.add_hline(y=0, line_dash="dash")
+        fig_r.update_layout(xaxis_title="Valor predicho", yaxis_title="Residuo")
+        ajustar(fig_r)
+        st.plotly_chart(fig_r, use_container_width=True)
+ 
+    with st.expander("📋 Ver tabla diaria utilizada"):
+        st.dataframe(datos, use_container_width=True, hide_index=True)
+ 
+# ================= VISTA 4: REGRESIÓN LINEAL MÚLTIPLE =================
+elif View == "Regresión Lineal Múltiple":
+    st.title("📊 Regresión Lineal Múltiple")
+    datos = tabla_diaria(dff)
+    num = [c for c in datos.columns if c != "Fecha"]
+    if len(datos) < 5:
+        st.warning("Hay muy pocos días con los filtros actuales para ajustar una regresión.")
+        st.stop()
+ 
+    Y_var = st.selectbox("Variable dependiente (Y)", num, index=num.index("Seguimientos"))
+    opciones_x = [c for c in num if c != Y_var]
+    pref = ["Leads", "Hora promedio", "Día de la semana (0=Lun)"]
+    X_vars = st.multiselect("Variables independientes (X)", opciones_x, default=[c for c in pref if c in opciones_x])
+    if not X_vars:
+        st.info("Selecciona al menos una variable independiente.")
+        st.stop()
+    if len(datos) - len(X_vars) - 1 <= 0:
+        st.warning("Hay más variables X que datos; quita alguna.")
+        st.stop()
+ 
+    X = datos[X_vars].to_numpy(float)
+    y = datos[Y_var].to_numpy(float)
+    b, pred, r2, r2a, rmse, mae = regresion(X, y)
+ 
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("🎯 R²", f"{r2:.3f}")
+    m2.metric("🎯 R² ajustada", f"{r2a:.3f}")
+    m3.metric("📏 RMSE", f"{rmse:.2f}")
+    m4.metric("📐 MAE", f"{mae:.2f}")
+    ecuacion = " + ".join(f"{c:.3f}×({v})" for c, v in zip(b[1:], X_vars))
+    st.info(f"**Ecuación:** {Y_var} = {b[0]:.3f} + {ecuacion}  ·  Ajuste {lectura_r2(r2)} (R² = {r2:.2f}).")
+ 
+    Contenedor_A, Contenedor_B = st.columns(2)
+    with Contenedor_A:
+        st.write("Valores reales vs. predichos")
+        lim = [min(y.min(), pred.min()), max(y.max(), pred.max())]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=y, y=pred, mode="markers", name="Predicho vs. real", marker=dict(size=9, color="#EF553B")))
+        fig.add_trace(go.Scatter(x=lim, y=lim, mode="lines", name="Ajuste perfecto", line=dict(dash="dash", color="gray")))
+        fig.update_layout(xaxis_title=f"{Y_var} real", yaxis_title=f"{Y_var} predicho")
+        ajustar(fig)
+        st.plotly_chart(fig, use_container_width=True)
+    with Contenedor_B:
+        st.write("Serie diaria: datos reales y predichos superpuestos")
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=datos["Fecha"], y=y, mode="lines+markers", name="Datos reales", line=dict(color="#636EFA")))
+        fig2.add_trace(go.Scatter(x=datos["Fecha"], y=pred, mode="markers", name="Datos predichos", marker=dict(size=8, symbol="diamond", color="#EF553B")))
+        fig2.update_layout(xaxis_title="Fecha", yaxis_title=Y_var)
+        ajustar(fig2)
+        fig2.update_xaxes(tickformat="%d %b")
+        st.plotly_chart(fig2, use_container_width=True)
+ 
+    Contenedor_C, Contenedor_D = st.columns(2)
+    with Contenedor_C:
+        st.write("Matriz de correlaciones")
+        corr = datos[[Y_var] + X_vars].corr()
+        fig3 = px.imshow(corr, text_auto=".2f", aspect="auto", color_continuous_scale="RdBu_r", zmin=-1, zmax=1)
+        fig3.update_layout(height=430)
+        st.plotly_chart(fig3, use_container_width=True)
+    with Contenedor_D:
+        st.write("📋 Coeficientes del modelo")
+        coef = pd.DataFrame({"Variable": ["Intercepto"] + X_vars, "Coeficiente": b.round(4)})
+        st.dataframe(coef, use_container_width=True, hide_index=True)
+        st.caption("Con pocos días de datos, un R² bajo es normal: indica que estas variables explican poco la variable Y.")
+ 
+# ================= VISTA 5: REGRESIÓN LOGÍSTICA (CLASIFICACIÓN + CALCULADORA) =================
+elif View == "Regresión Logística":
+    st.title("🧮 Regresión Logística · Clasificación y Calculadora")
+    st.caption("Etapa III · Modelado predictivo y clasificación. La variable a predecir es dicotómica (1 = Sí / 0 = No); "
+               "las clases desbalanceadas se corrigen con **Reponderación de clases** u **Oversampling** (solo sobre el entrenamiento).")
+ 
+    # ---- 1. Variables dicotómicas (objetivos) ----
+    d = dff.copy()
+    d["Día de la semana (0=Lun)"] = d["Fecha Origen"].dt.dayofweek
+    objetivos = {
+        "Seguimiento": ((d["Seguimiento"] == "Sí"), "Seguimiento"),
+        "Cita efectiva": ((d["Cita efetiva"] == "Sí"), "Cita efetiva"),
+        "Prueba de manejo (PDM)": ((d["PDM"] == "Sí"), "PDM"),
+        "Solicitud de crédito (SDC)": ((d["SDC"] == "Sí"), "SDC"),
+        "Estatus avanzado (Finalizado/Facturado)": (d["Estatus"].isin(["Finalizado", "Facturado"]), "Estatus"),
+    }
+ 
+    cA, cB = st.columns([2, 3])
+    nombre_y = cA.selectbox("Variable dicotómica a predecir (Y)", list(objetivos))
+    y_serie, col_excluir = objetivos[nombre_y]
+    y_all = y_serie.astype(int).to_numpy()
+ 
+    candidatas = [c for c in ["Hora", "Día de la semana (0=Lun)", "Producto", "Origen", "Asesor",
+                              "Seguimiento", "Cita efetiva", "PDM", "SDC", "Estatus"] if c != col_excluir]
+    X_vars = cB.multiselect("📌 Variables independientes (X)", candidatas,
+                            default=[c for c in ["Hora", "Día de la semana (0=Lun)", "Producto", "Origen", "Seguimiento"] if c in candidatas])
+    if not X_vars:
+        st.info("Selecciona al menos una variable independiente.")
+        st.stop()
+ 
+    n1, n0 = int(y_all.sum()), int(len(y_all) - y_all.sum())
+    if min(n1, n0) < 4:
+        st.warning(f"Con los filtros actuales solo hay {min(n1, n0)} casos en la clase minoritaria; se necesitan al menos 4 para entrenar y evaluar.")
+        st.stop()
+ 
+    # ---- 2. Parámetros ----
+    p1, p2, p3, p4 = st.columns(4)
+    metodo = p1.selectbox("⚖️ Ajuste de desbalance", METODOS, index=1)
+    umbral = p2.slider("Umbral de clasificación", 0.05, 0.95, 0.50, 0.05)
+    test = p3.slider("% datos de prueba", 10, 50, 25, 5) / 100
+    semilla = p4.number_input("Semilla aleatoria", 0, 9999, 42)
+    l2 = 1.0
+ 
+    categoricas = [c for c in X_vars if c in ["Producto", "Origen", "Asesor", "Seguimiento", "Cita efetiva", "PDM", "SDC", "Estatus"]]
+    X_raw = d[X_vars].reset_index(drop=True)
+    X_cod = codificar(X_raw, categoricas)
+    columnas = list(X_cod.columns)
+    X_all = X_cod.to_numpy(float)
+ 
+    idx_tr, idx_te = partir_estratificado(y_all, test, int(semilla))
+    Xtr, ytr, Xte, yte = X_all[idx_tr], y_all[idx_tr], X_all[idx_te], y_all[idx_te]
+ 
+    modelo = entrenar(Xtr, ytr, metodo, int(semilla), l2)
+    p_te = proba(modelo, Xte)
+    m = metricas(yte, p_te, umbral)
+ 
+    # ---- 3. KPIs ----
+    st.markdown(f"**Datos:** {len(y_all)} leads · Clase 1 («Sí»): {n1} ({100 * n1 / len(y_all):.1f}%) · Clase 0 («No»): {n0} · "
+                f"Entrenamiento: {len(ytr)} · Prueba: {len(yte)} ({int(yte.sum())} positivos)")
+    k = st.columns(6)
+    k[0].metric("Exactitud", f"{m['Exactitud']:.2%}")
+    k[1].metric("Precisión", f"{m['Precisión']:.2%}")
+    k[2].metric("Sensibilidad", f"{m['Sensibilidad']:.2%}")
+    k[3].metric("Especificidad", f"{m['Especificidad']:.2%}")
+    k[4].metric("F1", f"{m['F1']:.2f}")
+    k[5].metric("AUC", f"{m['AUC']:.2f}")
+    if n1 / len(y_all) < 0.2 or n1 / len(y_all) > 0.8:
+        st.info("**Clases desbalanceadas:** la exactitud puede ser engañosa (un modelo que siempre diga «No» ya tendría exactitud alta). "
+                "Fíjate sobre todo en **sensibilidad** y **precisión**, y compara los tres métodos en la tabla de abajo.")
+ 
+    # ---- 4. Matriz de confusión y ROC ----
+    g1, g2 = st.columns(2)
+    with g1:
+        st.write("Matriz de confusión (conjunto de prueba)")
+        cm = pd.DataFrame([[m["tn"], m["fp"]], [m["fn"], m["tp"]]],
+                          index=["Real: No", "Real: Sí"], columns=["Predicho: No", "Predicho: Sí"])
+        fig_cm = px.imshow(cm, text_auto=True, color_continuous_scale="Blues", aspect="auto")
+        fig_cm.update_layout(height=380, margin=dict(t=30, b=40, l=60, r=20), coloraxis_showscale=False)
+        st.plotly_chart(fig_cm, use_container_width=True)
+    with g2:
+        st.write("Curva ROC (conjunto de prueba)")
+        fpr, tpr = curva_roc(yte, p_te)
+        fig_roc = go.Figure()
+        fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines", name=f"Modelo (AUC={m['AUC']:.2f})", line=dict(color="#EF553B", width=3)))
+        fig_roc.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Azar", line=dict(dash="dash", color="gray")))
+        fig_roc.update_layout(xaxis_title="1 − Especificidad (FPR)", yaxis_title="Sensibilidad (TPR)")
+        ajustar(fig_roc, 380)
+        st.plotly_chart(fig_roc, use_container_width=True)
+ 
+    # ---- 5. Comparación de métodos de balanceo ----
+    st.subheader("⚖️ Comparación: sin ajuste vs. reponderación vs. oversampling")
+    filas = []
+    for met in METODOS:
+        mod = entrenar(Xtr, ytr, met, int(semilla), l2)
+        mm = metricas(yte, proba(mod, Xte), umbral)
+        filas.append({"Método": met, "Exactitud": mm["Exactitud"], "Precisión": mm["Precisión"], "Sensibilidad": mm["Sensibilidad"],
+                      "Especificidad": mm["Especificidad"], "F1": mm["F1"], "AUC": mm["AUC"],
+                      "VP": mm["tp"], "VN": mm["tn"], "FP": mm["fp"], "FN": mm["fn"]})
+    comp = pd.DataFrame(filas)
+    h1, h2 = st.columns([3, 2])
+    with h1:
+        st.dataframe(comp.round(3), use_container_width=True, hide_index=True)
+        st.caption("VP/VN/FP/FN = verdaderos positivos, verdaderos negativos, falsos positivos y falsos negativos.")
+    with h2:
+        largo = comp.melt(id_vars="Método", value_vars=["Precisión", "Sensibilidad", "F1"], var_name="Métrica", value_name="Valor")
+        fig_c = px.bar(largo, x="Método", y="Valor", color="Métrica", barmode="group", range_y=[0, 1])
+        fig_c.update_xaxes(tickangle=-20)
+        ajustar(fig_c, 320)
+        st.plotly_chart(fig_c, use_container_width=True)
+ 
+    # ---- 6. Coeficientes ----
+    st.subheader("📋 Coeficientes del modelo")
+    b_mod = modelo[0]
+    coef = pd.DataFrame({"Variable": columnas, "Coeficiente (estandarizado)": b_mod[1:].round(4),
+                         "Odds ratio (por +1 desv. est.)": np.exp(b_mod[1:]).round(3)})
+    coef = coef.reindex(coef["Coeficiente (estandarizado)"].abs().sort_values(ascending=False).index)
+    st.dataframe(coef, use_container_width=True, hide_index=True)
+    st.caption("Odds ratio > 1 aumenta la probabilidad de «Sí»; < 1 la disminuye. Las variables se estandarizan para poder compararlas entre sí.")
+ 
+    # ---- 7. CALCULADORA ----
+    st.subheader("🧮 Calculadora de probabilidad")
+    st.write(f"Captura las características de un lead y el modelo estimará la probabilidad de **{nombre_y}**.")
+    entradas = {}
+    cols_calc = st.columns(min(len(X_vars), 4))
+    for i, v in enumerate(X_vars):
+        with cols_calc[i % len(cols_calc)]:
+            if v in categoricas:
+                opciones = sorted(d[v].dropna().unique())
+                entradas[v] = st.selectbox(v, opciones, key=f"calc_{v}")
+            elif v == "Hora":
+                entradas[v] = st.slider("Hora de origen", 0, 23, int(d["Hora"].median()), key="calc_hora")
+            elif v == "Día de la semana (0=Lun)":
+                dia = st.selectbox("Día de la semana", list(DIAS.values()), key="calc_dia")
+                entradas[v] = [k_ for k_, val in DIAS.items() if val == dia][0]
+            else:
+                entradas[v] = st.number_input(v, value=float(d[v].median()), key=f"calc_{v}")
+ 
+    fila = pd.DataFrame([entradas])
+    X_union = codificar(pd.concat([X_raw, fila], ignore_index=True), categoricas)
+    x_nuevo = X_union.reindex(columns=columnas, fill_value=0.0).iloc[[-1]].to_numpy(float)
+    prob = float(proba(modelo, x_nuevo)[0])
+ 
+    r1, r2_, r3 = st.columns([1, 1, 2])
+    r1.metric("Probabilidad estimada", f"{prob:.1%}")
+    r2_.metric("Clasificación", "✅ Sí" if prob >= umbral else "❌ No", help=f"Umbral actual: {umbral:.2f}")
+    with r3:
+        st.progress(min(max(prob, 0.0), 1.0))
+        st.caption(f"Probabilidad base en la muestra: {n1 / len(y_all):.1%}. Método de ajuste: {metodo}.")
+ 
